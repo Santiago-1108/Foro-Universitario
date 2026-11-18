@@ -1,0 +1,27 @@
+Proyecto académico pequeño: foro universitario con 3 microservicios REST en Flask.
+
+STACK (no cambiar ni agregar nada más):
+- Python, Flask, psycopg2 (PostgreSQL en Supabase), PyJWT. Nada de SQLAlchemy, Docker, Swagger, tests, frontend ni librerías extra.
+- SQL escrito a mano con cursores, igual que el resto del proyecto.
+
+ESTRUCTURA (respetar exactamente):
+- El proyecto se divide en dos carpetas: backend/ (Flask) y frontend/ (Vue + Vite)
+- backend/app_usuarios.py (:5000), backend/app_preguntas.py (:5001), backend/app_interacciones.py (:5002)
+- backend/config.py (lee DATABASE_URL y JWT_SECRET de variables de entorno), backend/extensions.py, backend/security.py
+- backend/routes/ con un Blueprint por archivo
+- backend/database/setup.sql con CREATE y INSERTS (PostgreSQL)
+- api/index.py: punto de entrada de Vercel, une los 3 servicios (no tiene rutas propias)
+- Base de datos: PostgreSQL en Supabase
+
+SEGURIDAD:
+- JWT con el mismo JWT_SECRET (variable de entorno leída en config.py) en los tres servicios.
+- Todos los endpoints protegidos con @token_requerido, excepto /auth/login y /auth/registro.
+- Contraseñas con hash (werkzeug.security).
+
+REGLAS DE TRABAJO:
+- Haz SOLO lo que pida el prompt actual. No toques archivos que no se mencionen.
+- No crees endpoints, tablas, columnas ni archivos que no se hayan pedido.
+- No refactorices ni "mejores" código existente.
+- Respuestas siempre en JSON con el código HTTP correcto.
+- Código simple y comentado en español, apto para un proyecto de clase.
+- Si algo es ambiguo, pregunta antes de asumir.
