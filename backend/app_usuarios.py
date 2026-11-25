@@ -14,6 +14,9 @@ from config import Config
 from extensions import mysql
 from routes.auth import auth_bp
 from routes.usuarios import usuarios_bp
+from routes.notificaciones import notificaciones_bp
+from routes.moderacion import moderacion_bp
+from routes.mensajes import mensajes_bp
 
 # 1) App Flask de este proceso (servicio de usuarios).
 app = Flask(__name__)
@@ -25,7 +28,10 @@ mysql.init_app(app)
 app.register_blueprint(auth_bp)
 # 4) Rutas de perfil/listado de usuarios: prefijo /usuarios (routes/usuarios.py).
 app.register_blueprint(usuarios_bp)
+app.register_blueprint(notificaciones_bp)
+app.register_blueprint(moderacion_bp)
+app.register_blueprint(mensajes_bp)
 
 # 5) Solo al ejecutar "python app_usuarios.py": servidor en puerto 5000.
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    app.run(port=5000, debug=False)

@@ -39,6 +39,7 @@ def _usuario_publico(fila):
         "correo": fila["correo"],
         "rol": fila["rol"],
         "fecha_registro": str(fila["fecha_registro"]),
+        "avatar_url": fila.get("avatar_url"),
     }
 
 
@@ -58,6 +59,9 @@ def registro():
     # Validación: los tres datos son obligatorios (password no se hace strip).
     if not nombre_apellido or not correo or not password:
         return jsonify({"error": "nombre_apellido, correo y password son obligatorios"}), 400
+
+    if len(password) < 8 or not password.strip():
+        return jsonify(error="La contraseña nueva debe tener al menos 8 caracteres"), 400
 
     cur = mysql.connection.cursor()
     # ¿Hay ya un usuario con ese correo? El correo debe ser único.
@@ -144,12 +148,16 @@ def login():
     if not usuario or not check_password_hash(usuario["password_hash"], password):
         return jsonify({"error": "Credenciales inválidas"}), 401
 
+    if usuario.get("suspendido"):
+        return jsonify({"error": "Cuenta suspendida"}), 403
+
     # Datos que viajarán dentro del JWT (luego serán g.usuario).
     payload = {
         "id": usuario["id"],
         "correo": usuario["correo"],
         "rol": usuario["rol"],
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24),
+        "version_sesion": usuario.get("version_sesion", 0),
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=24),
     }
     # Firma el payload. Sin esta clave, security.py no podrá decodificarlo.
     token = jwt.encode(payload, Config.JWT_SECRET, algorithm=Config.JWT_ALGORITHM)

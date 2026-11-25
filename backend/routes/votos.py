@@ -1,51 +1,12 @@
-"""
-Qué hace este archivo:
-    Votos +1 o -1 sobre una pregunta O una respuesta (nunca las dos
-    a la vez, ni ninguna). El votante sale del JWT. Un usuario no
-    puede votar dos veces lo mismo (409). Los GET suman los +1/-1
-    (total_votos) y cuentan filas (cantidad). Borrar: solo el dueño
-    del voto, no el admin.
-
-A qué servicio pertenece:
-    Servicio de interacciones. Lo registra app_interacciones.py
-    (app.register_blueprint(votos_bp)), puerto 5002.
-
-Qué importa:
-    - flask: Blueprint, g, jsonify, request.
-    - extensions.mysql: conexión (votos, preguntas, respuestas).
-    - security.token_requerido: JWT → g.usuario.
-
-Quién lo usa:
-    Cliente del puerto 5002, rutas /votos... Los GET de totales son
-    públicos; crear y borrar un voto piden JWT.
-    Depende de que existan la pregunta (servicio de preguntas) o
-    la respuesta (respuestas.py) al crear el voto.
-
-Cómo se vota una sola cosa:
-    El body trae voto y, como destino, id_pregunta y/o id_respuesta.
-    hay_pregunta y hay_respuesta son True/False. Si son iguales
-    (los dos True o los dos False) → 400: hay que mandar exactamente
-    uno. Luego, si hay pregunta, id_respuesta se guarda NULL (y al
-    revés). Así cada fila apunta a un único objetivo.
-
-Cómo se evita el voto duplicado:
-    Tras comprobar que el objetivo existe, SELECT en votos con
-    id_usuario del token + id_pregunta (o id_respuesta). Si ya hay
-    fila → 409 y no hay INSERT. No hay PUT: para cambiar de +1 a -1
-    habría que DELETE y volver a POST.
-
-Cómo se calculan total y cantidad:
-    GET suma voto (1 o -1) con SUM: es el puntaje neto
-    (3 likes y 1 dislike → total 2). COUNT(*) es cuántas personas
-    votaron, sin importar el signo. COALESCE(..., 0) hace que, si
-    no hay filas, SUM sea 0 y no NULL. Esos GET no verifican que
-    la pregunta/respuesta exista: sin votos responden 0 y 0.
+"""Votos idempotentes sobre preguntas y respuestas. POST establece -1/0/+1;
+GET consulta totales y DELETE conserva la ruta histórica por id de voto.
+Las restricciones UNIQUE existentes arbitran solicitudes concurrentes.
 """
 
 from flask import Blueprint, g, jsonify, request
 
 from extensions import mysql
-from security import token_requerido
+from security import token_requerido, _usuario_desde_token
 
 # Prefijo /votos → POST /votos, GET .../pregunta|respuesta/<id>, DELETE .../<id>
 votos_bp = Blueprint("votos", __name__, url_prefix="/votos")
@@ -111,179 +72,70 @@ def _buscar_voto(cur, id_voto):
 @votos_bp.route("", methods=["POST"])
 @token_requerido
 def crear_voto():
-    """
-    Qué hace:
-        Registra un +1 o -1. Pasos:
-        1) XOR: exactamente uno de id_pregunta / id_respuesta.
-        2) voto debe ser 1 o -1 (no 0 ni otro número).
-        3) id_usuario = g.usuario["id"] (no viene en el body).
-        4) SELECT en preguntas o respuestas: si no existe → 404.
-        5) SELECT si este usuario ya votó ese id → 409.
-        6) INSERT con el otro id en NULL + commit.
-
-    Ruta y método:
-        POST /votos
-
-    Quién puede usarlo:
-        JWT. Cualquier autenticado.
-
-    Entrada:
-        Body JSON: voto (1 o -1) y exactamente uno de
-        id_pregunta o id_respuesta.
-
-    Base de datos:
-        - preguntas o respuestas: SELECT id
-        - votos: SELECT duplicado; INSERT; commit; SELECT del nuevo
-
-    Respuestas:
-        201: voto creado.
-        400: los dos ids, ninguno, o voto distinto de 1/-1.
-        404: pregunta o respuesta inexistente (no inserta).
-        409: este usuario ya votó esa pregunta o respuesta.
-        401: JWT inválido.
-    """
-    datos = request.get_json(silent=True) or {}
+    """Establece el voto (+1/-1) o lo cancela (0), de forma idempotente."""
+    datos = request.get_json()
     voto = datos.get("voto")
     id_pregunta = datos.get("id_pregunta")
     id_respuesta = datos.get("id_respuesta")
-
-    # Debe venir exactamente uno: pregunta o respuesta
-    hay_pregunta = id_pregunta is not None
-    hay_respuesta = id_respuesta is not None
-    if hay_pregunta == hay_respuesta:
-        return jsonify({
-            "error": "Debe enviar exactamente uno entre id_pregunta e id_respuesta"
-        }), 400
-
-    if voto not in (1, -1):
-        return jsonify({"error": "voto inválido; debe ser 1 o -1"}), 400
-
-    # El votante sale del token, no del body
-    id_usuario = g.usuario.get("id")
-
-    cur = mysql.connection.cursor()
-    if hay_pregunta:
-        cur.execute("SELECT id FROM preguntas WHERE id = %s", (id_pregunta,))
+    if (id_pregunta is None) == (id_respuesta is None):
+        return jsonify({"error": "Debe enviar exactamente un destino"}), 400
+    if type(voto) is not int or voto not in (-1, 0, 1):
+        return jsonify({"error": "voto inválido; debe ser -1, 0 o 1"}), 400
+    # Los nombres SQL son constantes internas, nunca datos del cliente.
+    tabla, columna, destino = ("preguntas", "id_pregunta", id_pregunta) if id_pregunta is not None else ("respuestas", "id_respuesta", id_respuesta)
+    id_usuario = g.usuario["id"]
+    with mysql.connection.cursor() as cur:
+        sql_destino = ("SELECT p.id FROM preguntas p WHERE p.id=%s AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) FOR UPDATE OF p"
+                       if tabla == "preguntas" else "SELECT p.id FROM preguntas p JOIN respuestas r ON r.id_pregunta=p.id WHERE r.id=%s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) AND NOT public.foro_hay_bloqueo(%s,r.id_usuario) FOR UPDATE OF p")
+        cur.execute(sql_destino, (destino,id_usuario) if tabla=="preguntas" else (destino,id_usuario,id_usuario))
         if not cur.fetchone():
-            cur.close()
-            return jsonify({"error": "Pregunta no encontrada"}), 404
+            return jsonify({"error": "Destino no encontrado"}), 404
+        if voto == 0:
+            cur.execute(f"DELETE FROM votos WHERE id_usuario = %s AND {columna} = %s", (id_usuario, destino))
+            resultado = {"id": None, "id_usuario": id_usuario, "id_pregunta": id_pregunta, "id_respuesta": id_respuesta, "voto": 0}
+        else:
+            cur.execute(f"""INSERT INTO votos (id_usuario, {columna}, voto)
+                VALUES (%s, %s, %s) ON CONFLICT (id_usuario, {columna})
+                DO UPDATE SET voto = EXCLUDED.voto
+                RETURNING id, id_usuario, id_pregunta, id_respuesta, voto""",
+                (id_usuario, destino, voto))
+            resultado = _voto_publico(cur.fetchone())
+        cur.execute(f"SELECT COALESCE(SUM(voto), 0) AS total_votos, COUNT(*) AS cantidad FROM votos WHERE {columna} = %s", (destino,))
+        resultado.update(cur.fetchone())
+        mysql.connection.commit()
+    return jsonify(resultado), 200
 
-        cur.execute(
-            "SELECT id FROM votos WHERE id_usuario = %s AND id_pregunta = %s",
-            (id_usuario, id_pregunta),
-        )
-        if cur.fetchone():
-            cur.close()
-            return jsonify({"error": "Ya votó esta pregunta"}), 409
 
-        cur.execute(
-            "INSERT INTO votos (id_usuario, id_pregunta, id_respuesta, voto) VALUES (%s, %s, NULL, %s) RETURNING id",
-            (id_usuario, id_pregunta, voto),
-        )
-    else:
-        cur.execute("SELECT id FROM respuestas WHERE id = %s", (id_respuesta,))
+def _consultar_votos(columna, destino):
+    identidad = None
+    if request.headers.get("Authorization"):
+        identidad, error = _usuario_desde_token()
+        if error:
+            return error
+    with mysql.connection.cursor() as cur:
+        uid = identidad["id"] if identidad else None
+        sql = ("SELECT id FROM preguntas WHERE id=%s AND fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,id_usuario)" if columna == "id_pregunta" else
+               "SELECT r.id FROM respuestas r JOIN preguntas p ON p.id=r.id_pregunta WHERE r.id=%s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) AND NOT public.foro_hay_bloqueo(%s,r.id_usuario)")
+        cur.execute(sql,(destino,uid) if columna=="id_pregunta" else (destino,uid,uid))
         if not cur.fetchone():
-            cur.close()
-            return jsonify({"error": "Respuesta no encontrada"}), 404
-
-        cur.execute(
-            "SELECT id FROM votos WHERE id_usuario = %s AND id_respuesta = %s",
-            (id_usuario, id_respuesta),
-        )
-        if cur.fetchone():
-            cur.close()
-            return jsonify({"error": "Ya votó esta respuesta"}), 409
-
-        cur.execute(
-            "INSERT INTO votos (id_usuario, id_pregunta, id_respuesta, voto) VALUES (%s, NULL, %s, %s) RETURNING id",
-            (id_usuario, id_respuesta, voto),
-        )
-
-    # RETURNING id: PostgreSQL devuelve aquí el id de la fila nueva (no existe cur.lastrowid).
-    nuevo_id = cur.fetchone()["id"]
-    mysql.connection.commit()
-    creado = _buscar_voto(cur, nuevo_id)
-    cur.close()
-    return jsonify(_voto_publico(creado)), 201
+            return jsonify(error="Destino no encontrado"),404
+        cur.execute(f"SELECT COALESCE(SUM(voto),0) AS total_votos, COUNT(*) AS cantidad FROM votos WHERE {columna}=%s", (destino,))
+        resultado = dict(cur.fetchone(), mi_voto=0)
+        if identidad:
+            cur.execute(f"SELECT voto FROM votos WHERE {columna}=%s AND id_usuario=%s", (destino,identidad["id"]))
+            fila = cur.fetchone()
+            resultado["mi_voto"] = fila["voto"] if fila else 0
+        return jsonify(resultado),200
 
 
 @votos_bp.route("/pregunta/<int:id_pregunta>", methods=["GET"])
 def votos_pregunta(id_pregunta):
-    """
-    Qué hace:
-        Agrega los votos de una pregunta.
-        total_votos = SUM(voto) → puntaje neto (+1 y -1).
-        cantidad = COUNT(*) → cuántos votos hay, da igual el signo.
-
-    Ruta y método:
-        GET /votos/pregunta/<id_pregunta>
-
-    Quién puede usarlo:
-        Público. No pide JWT.
-
-    Entrada:
-        URL: id_pregunta.
-
-    Base de datos:
-        Tabla votos: SELECT SUM y COUNT WHERE id_pregunta.
-        No consulta si la pregunta existe. No escribe.
-
-    Respuestas:
-        200: {total_votos, cantidad} (0 y 0 si no hay filas o el id no existe).
-    """
-    cur = mysql.connection.cursor()
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(voto), 0) AS total_votos, COUNT(*) AS cantidad
-        FROM votos
-        WHERE id_pregunta = %s
-        """,
-        (id_pregunta,),
-    )
-    fila = cur.fetchone()
-    cur.close()
-    return jsonify({
-        "total_votos": int(fila["total_votos"]),
-        "cantidad": fila["cantidad"],
-    }), 200
+    return _consultar_votos("id_pregunta",id_pregunta)
 
 
 @votos_bp.route("/respuesta/<int:id_respuesta>", methods=["GET"])
 def votos_respuesta(id_respuesta):
-    """
-    Qué hace:
-        Igual que votos_pregunta, filtrando por id_respuesta.
-
-    Ruta y método:
-        GET /votos/respuesta/<id_respuesta>
-
-    Quién puede usarlo:
-        Público. No pide JWT.
-
-    Entrada:
-        URL: id_respuesta.
-
-    Base de datos:
-        Tabla votos: SUM y COUNT WHERE id_respuesta. No escribe.
-
-    Respuestas:
-        200: {total_votos, cantidad}.
-    """
-    cur = mysql.connection.cursor()
-    cur.execute(
-        """
-        SELECT COALESCE(SUM(voto), 0) AS total_votos, COUNT(*) AS cantidad
-        FROM votos
-        WHERE id_respuesta = %s
-        """,
-        (id_respuesta,),
-    )
-    fila = cur.fetchone()
-    cur.close()
-    return jsonify({
-        "total_votos": int(fila["total_votos"]),
-        "cantidad": fila["cantidad"],
-    }), 200
+    return _consultar_votos("id_respuesta",id_respuesta)
 
 
 @votos_bp.route("/<int:id_voto>", methods=["DELETE"])

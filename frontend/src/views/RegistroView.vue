@@ -20,6 +20,10 @@ async function crearCuenta() {
     return
   }
 
+  if (password.value.length < 8 || !password.value.trim()) {
+    error.value = 'La contraseña debe tener al menos 8 caracteres.'
+    return
+  }
   cargando.value = true
   try {
     await apiFetch('usuarios', '/auth/registro', {

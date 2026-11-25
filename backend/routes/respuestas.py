@@ -24,7 +24,7 @@ Quién lo usa:
 from flask import Blueprint, g, jsonify, request
 
 from extensions import mysql
-from security import token_requerido
+from security import token_requerido, _usuario_desde_token
 
 # Prefijo /respuestas → /respuestas, /respuestas/<id>, /respuestas/pregunta/<id>
 respuestas_bp = Blueprint("respuestas", __name__, url_prefix="/respuestas")
@@ -32,9 +32,10 @@ respuestas_bp = Blueprint("respuestas", __name__, url_prefix="/respuestas")
 # Respuesta + nombre del autor
 SQL_RESPUESTA_DETALLE = """
     SELECT r.id, r.id_usuario, r.id_pregunta, r.contenido, r.fecha_creacion,
-           u.nombre_apellido AS nombre_autor
+           u.nombre_apellido AS nombre_autor, u.avatar_url AS avatar_autor
     FROM respuestas r
     JOIN usuarios u ON u.id = r.id_usuario
+    JOIN preguntas p ON p.id = r.id_pregunta
 """
 
 
@@ -65,6 +66,7 @@ def _respuesta_publica(fila):
         "contenido": fila["contenido"],
         "fecha_creacion": str(fila["fecha_creacion"]),
         "nombre_autor": fila["nombre_autor"],
+        "avatar_autor": fila.get("avatar_autor"),
     }
 
 
@@ -89,7 +91,7 @@ def _buscar_respuesta(cur, id_respuesta):
     Respuestas:
         Fila o None. No envía HTTP.
     """
-    cur.execute(SQL_RESPUESTA_DETALLE + " WHERE r.id = %s", (id_respuesta,))
+    cur.execute(SQL_RESPUESTA_DETALLE + " WHERE r.id = %s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL", (id_respuesta,))
     return cur.fetchone()
 
 
@@ -142,15 +144,22 @@ def listar_por_pregunta(id_pregunta):
         200: lista (puede ser [] si la pregunta existe pero no tiene respuestas).
         404: esa pregunta no está en la tabla preguntas.
     """
+    uid = None
+    gestion = request.args.get('gestion') == '1'
+    if request.headers.get('Authorization') or gestion:
+        identidad,error=_usuario_desde_token()
+        if error: return error
+        if gestion and identidad['rol'] != 'admin': return jsonify(error='No autorizado'),403
+        uid=None if gestion else identidad['id']
     cur = mysql.connection.cursor()
-    cur.execute("SELECT id FROM preguntas WHERE id = %s", (id_pregunta,))
+    cur.execute("SELECT id FROM preguntas WHERE id = %s AND fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,id_usuario)", (id_pregunta,uid))
     if not cur.fetchone():
         cur.close()
         return jsonify({"error": "Pregunta no encontrada"}), 404
 
     cur.execute(
-        SQL_RESPUESTA_DETALLE + " WHERE r.id_pregunta = %s ORDER BY r.fecha_creacion ASC",
-        (id_pregunta,),
+        SQL_RESPUESTA_DETALLE + " WHERE r.id_pregunta = %s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,r.id_usuario) ORDER BY r.fecha_creacion ASC, r.id ASC",
+        (id_pregunta,uid),
     )
     filas = cur.fetchall()
     cur.close()
@@ -181,6 +190,11 @@ def obtener_respuesta(id_respuesta):
     """
     cur = mysql.connection.cursor()
     respuesta = _buscar_respuesta(cur, id_respuesta)
+    if respuesta and request.headers.get('Authorization'):
+        identidad,error=_usuario_desde_token()
+        if error: cur.close(); return error
+        cur.execute('SELECT NOT public.foro_hay_bloqueo(%s,r.id_usuario) AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) AS visible FROM respuestas r JOIN preguntas p ON p.id=r.id_pregunta WHERE r.id=%s',(identidad['id'],identidad['id'],id_respuesta))
+        if not cur.fetchone()['visible']: respuesta=None
     cur.close()
     if not respuesta:
         return jsonify({"error": "Respuesta no encontrada"}), 404
@@ -230,10 +244,15 @@ def crear_respuesta():
     id_usuario = g.usuario.get("id")
 
     cur = mysql.connection.cursor()
-    cur.execute("SELECT id FROM preguntas WHERE id = %s", (id_pregunta,))
-    if not cur.fetchone():
+    cur.execute("SELECT id,cerrada FROM preguntas WHERE id = %s AND fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,id_usuario) FOR UPDATE", (id_pregunta,id_usuario))
+    pregunta = cur.fetchone()
+    if not pregunta:
         cur.close()
         return jsonify({"error": "Pregunta no encontrada"}), 404
+
+    if pregunta.get("cerrada"):
+        cur.close()
+        return jsonify(error="Conversación cerrada por moderación"), 409
 
     cur.execute(
         "INSERT INTO respuestas (id_usuario, id_pregunta, contenido) VALUES (%s, %s, %s) RETURNING id",
@@ -274,7 +293,9 @@ def actualizar_respuesta(id_respuesta):
         401: JWT inválido.
     """
     cur = mysql.connection.cursor()
-    respuesta = _buscar_respuesta(cur, id_respuesta)
+    cur.execute("SELECT p.id FROM preguntas p JOIN respuestas r ON r.id_pregunta=p.id WHERE r.id=%s AND p.fecha_eliminacion IS NULL AND r.fecha_eliminacion IS NULL FOR UPDATE OF p", (id_respuesta,))
+    bloqueo = cur.fetchone()
+    respuesta = _buscar_respuesta(cur, id_respuesta) if bloqueo else None
     if not respuesta:
         cur.close()
         return jsonify({"error": "Respuesta no encontrada"}), 404
@@ -313,8 +334,8 @@ def eliminar_respuesta(id_respuesta):
         URL: id_respuesta.
 
     Base de datos:
-        respuestas: SELECT, DELETE, commit.
-        No mira comentarios ni votos en este archivo.
+        respuestas: SELECT, UPDATE fecha_eliminacion, commit.
+        Conserva comentarios y votos; desmarca la solución si corresponde.
 
     Respuestas:
         200: {"mensaje": "Respuesta eliminada"}.
@@ -323,7 +344,9 @@ def eliminar_respuesta(id_respuesta):
         401: JWT inválido.
     """
     cur = mysql.connection.cursor()
-    respuesta = _buscar_respuesta(cur, id_respuesta)
+    cur.execute("SELECT p.id FROM preguntas p JOIN respuestas r ON r.id_pregunta=p.id WHERE r.id=%s AND p.fecha_eliminacion IS NULL AND r.fecha_eliminacion IS NULL FOR UPDATE OF p", (id_respuesta,))
+    bloqueo = cur.fetchone()
+    respuesta = _buscar_respuesta(cur, id_respuesta) if bloqueo else None
     if not respuesta:
         cur.close()
         return jsonify({"error": "Respuesta no encontrada"}), 404
@@ -332,7 +355,10 @@ def eliminar_respuesta(id_respuesta):
         cur.close()
         return jsonify({"error": "No autorizado para eliminar esta respuesta"}), 403
 
-    cur.execute("DELETE FROM respuestas WHERE id = %s", (id_respuesta,))
+    cur.execute("UPDATE preguntas SET id_respuesta_aceptada=NULL WHERE id=%s AND id_respuesta_aceptada=%s", (respuesta["id_pregunta"],id_respuesta))
+    cur.execute("UPDATE respuestas SET fecha_eliminacion=now() WHERE id=%s", (id_respuesta,))
+    if g.usuario["rol"] == "admin":
+        cur.execute("INSERT INTO historial_moderacion(id_admin,accion,tipo,id_objeto) VALUES (%s,'eliminar','respuesta',%s)", (g.usuario["id"],id_respuesta))
     mysql.connection.commit()
     cur.close()
     return jsonify({"mensaje": "Respuesta eliminada"}), 200

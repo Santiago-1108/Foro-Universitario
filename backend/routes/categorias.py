@@ -25,7 +25,7 @@ Quién lo usa:
 from flask import Blueprint, g, jsonify, request
 
 from extensions import mysql
-from security import token_requerido
+from security import token_requerido, _usuario_desde_token
 
 # Prefijo /categorias → GET/POST /categorias y PUT/DELETE /categorias/<id>
 categorias_bp = Blueprint("categorias", __name__, url_prefix="/categorias")
@@ -127,11 +127,19 @@ def listar_categorias():
     Respuestas:
         200: lista JSON.
     """
-    cur = mysql.connection.cursor()
-    cur.execute("SELECT id, nombre, descripcion FROM categorias")
-    filas = cur.fetchall()
-    cur.close()
-    return jsonify([_categoria_publica(f) for f in filas]), 200
+    visitante = None
+    if request.headers.get('Authorization'):
+        identidad, error = _usuario_desde_token()
+        if error:
+            return error
+        visitante = identidad['id']
+    with mysql.connection.cursor() as cur:
+        cur.execute("""SELECT c.id,c.nombre,c.descripcion,
+          (SELECT COUNT(*) FROM seguimientos_categorias s WHERE s.id_categoria=c.id) AS seguidores,
+          (SELECT COUNT(*) FROM preguntas p WHERE p.id_categoria=c.id AND p.fecha_eliminacion IS NULL) AS publicaciones,
+          EXISTS(SELECT 1 FROM seguimientos_categorias s WHERE s.id_categoria=c.id AND s.id_usuario=%s) AS siguiendo
+          FROM categorias c ORDER BY c.nombre,c.id""", (visitante,))
+        return jsonify(cur.fetchall()), 200
 
 
 @categorias_bp.route("", methods=["POST"])
@@ -286,3 +294,21 @@ def eliminar_categoria(id_categoria):
     mysql.connection.commit()
     cur.close()
     return jsonify({"mensaje": "Categoría eliminada"}), 200
+
+
+@categorias_bp.route('/<int:id_categoria>/seguir', methods=['PUT'])
+@token_requerido
+def seguir_categoria(id_categoria):
+    seguir = request.get_json(silent=True).get('seguir')
+    if type(seguir) is not bool:
+        return jsonify({'error':'seguir debe ser booleano'}),400
+    with mysql.connection.cursor() as cur:
+        if not _buscar_categoria(cur,id_categoria):
+            return jsonify({'error':'Categoría no encontrada'}),404
+        clave = (g.usuario['id'],id_categoria)
+        if seguir:
+            cur.execute('INSERT INTO seguimientos_categorias(id_usuario,id_categoria) VALUES (%s,%s) ON CONFLICT DO NOTHING',clave)
+        else:
+            cur.execute('DELETE FROM seguimientos_categorias WHERE id_usuario=%s AND id_categoria=%s',clave)
+    mysql.connection.commit()
+    return jsonify({'siguiendo':seguir})

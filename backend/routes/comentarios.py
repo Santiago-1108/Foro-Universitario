@@ -23,17 +23,19 @@ Quién lo usa:
 from flask import Blueprint, g, jsonify, request
 
 from extensions import mysql
-from security import token_requerido
+from security import token_requerido, _usuario_desde_token
 
 # Prefijo /comentarios → POST /comentarios, GET .../respuesta/<id>, DELETE .../<id>
 comentarios_bp = Blueprint("comentarios", __name__, url_prefix="/comentarios")
 
 # Comentario + nombre del autor
 SQL_COMENTARIO_DETALLE = """
-    SELECT c.id, c.id_usuario, c.id_respuesta, c.contenido, c.fecha_creacion,
-           u.nombre_apellido AS nombre_autor
+    SELECT c.id, c.id_usuario, c.id_respuesta, c.contenido, c.fecha_creacion, c.id_comentario_padre, c.fecha_eliminacion,
+           u.nombre_apellido AS nombre_autor, u.avatar_url AS avatar_autor
     FROM comentarios c
     JOIN usuarios u ON u.id = c.id_usuario
+    JOIN respuestas r ON r.id=c.id_respuesta
+    JOIN preguntas p ON p.id=r.id_pregunta
 """
 
 
@@ -59,11 +61,14 @@ def _comentario_publico(fila):
     """
     return {
         "id": fila["id"],
-        "id_usuario": fila["id_usuario"],
+        "id_usuario": None if fila.get("fecha_eliminacion") else fila["id_usuario"],
+        "id_comentario_padre": fila.get("id_comentario_padre"),
+        "eliminado": bool(fila.get("fecha_eliminacion")),
         "id_respuesta": fila["id_respuesta"],
-        "contenido": fila["contenido"],
+        "contenido": "[Comentario eliminado]" if fila.get("fecha_eliminacion") else fila["contenido"],
         "fecha_creacion": str(fila["fecha_creacion"]),
-        "nombre_autor": fila["nombre_autor"],
+        "nombre_autor": "" if fila.get("fecha_eliminacion") else fila["nombre_autor"],
+        "avatar_autor": None if fila.get("fecha_eliminacion") else fila.get("avatar_autor"),
     }
 
 
@@ -88,7 +93,7 @@ def _buscar_comentario(cur, id_comentario):
     Respuestas:
         Fila o None. No envía HTTP.
     """
-    cur.execute(SQL_COMENTARIO_DETALLE + " WHERE c.id = %s", (id_comentario,))
+    cur.execute(SQL_COMENTARIO_DETALLE + " WHERE c.id = %s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL", (id_comentario,))
     return cur.fetchone()
 
 
@@ -139,10 +144,17 @@ def listar_por_respuesta(id_respuesta):
     Respuestas:
         200: lista (vacía si no hay comentarios o la respuesta no existe).
     """
+    uid = None
+    gestion = request.args.get('gestion') == '1'
+    if request.headers.get('Authorization') or gestion:
+        identidad,error=_usuario_desde_token()
+        if error: return error
+        if gestion and identidad['rol'] != 'admin': return jsonify(error='No autorizado'),403
+        uid=None if gestion else identidad['id']
     cur = mysql.connection.cursor()
     cur.execute(
-        SQL_COMENTARIO_DETALLE + " WHERE c.id_respuesta = %s ORDER BY c.fecha_creacion ASC",
-        (id_respuesta,),
+        SQL_COMENTARIO_DETALLE + " WHERE c.id_respuesta = %s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) AND NOT public.foro_hay_bloqueo(%s,r.id_usuario) AND NOT public.foro_hay_bloqueo(%s,c.id_usuario) ORDER BY c.fecha_creacion ASC, c.id ASC",
+        (id_respuesta,uid,uid,uid),
     )
     filas = cur.fetchall()
     cur.close()
@@ -192,15 +204,30 @@ def crear_comentario():
     id_usuario = g.usuario.get("id")
 
     cur = mysql.connection.cursor()
-    cur.execute("SELECT id FROM respuestas WHERE id = %s", (id_respuesta,))
-    if not cur.fetchone():
+    cur.execute("SELECT p.id,p.cerrada FROM preguntas p JOIN respuestas r ON r.id_pregunta=p.id WHERE r.id=%s AND r.fecha_eliminacion IS NULL AND p.fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,p.id_usuario) AND NOT public.foro_hay_bloqueo(%s,r.id_usuario) FOR UPDATE OF p", (id_respuesta,id_usuario,id_usuario))
+    pregunta = cur.fetchone()
+    if not pregunta:
         cur.close()
         return jsonify({"error": "Respuesta no encontrada"}), 404
 
-    cur.execute(
-        "INSERT INTO comentarios (id_usuario, id_respuesta, contenido) VALUES (%s, %s, %s) RETURNING id",
-        (id_usuario, id_respuesta, contenido),
-    )
+    if pregunta.get("cerrada"):
+        cur.close()
+        return jsonify(error="Conversación cerrada por moderación"), 409
+
+    cur.execute("SELECT id FROM respuestas WHERE id=%s AND fecha_eliminacion IS NULL", (id_respuesta,))
+    if not cur.fetchone():
+        cur.close()
+        return jsonify(error="Respuesta no encontrada"),404
+    padre = datos.get("id_comentario_padre")
+    if padre is not None:
+        if type(padre) is not int or not 0 < padre <= 9223372036854775807:
+            cur.close()
+            return jsonify(error="Comentario padre inválido"), 400
+        cur.execute("SELECT id FROM comentarios WHERE id=%s AND id_respuesta=%s AND fecha_eliminacion IS NULL AND NOT public.foro_hay_bloqueo(%s,id_usuario)", (padre,id_respuesta,id_usuario))
+        if not cur.fetchone():
+            cur.close()
+            return jsonify(error="Comentario padre no disponible en esta respuesta"), 404
+    cur.execute("INSERT INTO comentarios (id_usuario,id_respuesta,contenido,id_comentario_padre) VALUES (%s,%s,%s,%s) RETURNING id", (id_usuario,id_respuesta,contenido,padre))
     # RETURNING id: PostgreSQL devuelve aquí el id de la fila nueva (no existe cur.lastrowid).
     nuevo_id = cur.fetchone()["id"]
     mysql.connection.commit()
@@ -226,7 +253,7 @@ def eliminar_comentario(id_comentario):
         URL: id_comentario.
 
     Base de datos:
-        comentarios: SELECT (JOIN), DELETE, commit.
+        comentarios: SELECT (JOIN), UPDATE fecha_eliminacion, commit.
 
     Respuestas:
         200: {"mensaje": "Comentario eliminado"}.
@@ -235,8 +262,9 @@ def eliminar_comentario(id_comentario):
         401: JWT inválido.
     """
     cur = mysql.connection.cursor()
-    comentario = _buscar_comentario(cur, id_comentario)
-    if not comentario:
+    cur.execute("SELECT p.id FROM preguntas p JOIN respuestas r ON r.id_pregunta=p.id JOIN comentarios c ON c.id_respuesta=r.id WHERE c.id=%s AND p.fecha_eliminacion IS NULL AND r.fecha_eliminacion IS NULL FOR UPDATE OF p", (id_comentario,))
+    comentario = _buscar_comentario(cur,id_comentario) if cur.fetchone() else None
+    if not comentario or comentario.get("fecha_eliminacion"):
         cur.close()
         return jsonify({"error": "Comentario no encontrado"}), 404
 
@@ -244,7 +272,9 @@ def eliminar_comentario(id_comentario):
         cur.close()
         return jsonify({"error": "No autorizado para eliminar este comentario"}), 403
 
-    cur.execute("DELETE FROM comentarios WHERE id = %s", (id_comentario,))
+    cur.execute("UPDATE comentarios SET fecha_eliminacion=now() WHERE id = %s", (id_comentario,))
+    if g.usuario["rol"] == "admin":
+        cur.execute("INSERT INTO historial_moderacion(id_admin,accion,tipo,id_objeto) VALUES (%s,'eliminar','comentario',%s)", (g.usuario["id"],id_comentario))
     mysql.connection.commit()
     cur.close()
     return jsonify({"mensaje": "Comentario eliminado"}), 200

@@ -1,8 +1,5 @@
 import { computed, ref } from 'vue'
 
-export const LIMITE_GRATIS = 500
-export const LIMITE_PREMIUM = 2000
-
 function leerUsuario() {
   try {
     const datos = JSON.parse(localStorage.getItem('usuario') || 'null')
@@ -15,8 +12,6 @@ function leerUsuario() {
 export const usuario = ref(localStorage.getItem('token') ? leerUsuario() : null)
 export const autenticado = computed(() => Boolean(localStorage.getItem('token') && usuario.value))
 export const esAdministrador = computed(() => usuario.value?.rol === 'admin')
-export const plan = ref(localStorage.getItem('plan_demo') === 'premium' ? 'premium' : 'gratis')
-export const limiteContenido = computed(() => (plan.value === 'premium' ? LIMITE_PREMIUM : LIMITE_GRATIS))
 
 export const modalAcceso = ref({
   abierto: false,
@@ -52,18 +47,8 @@ export function cerrarSesionLocal() {
   usuario.value = null
 }
 
-export function activarPremiumDemo() {
-  localStorage.setItem('plan_demo', 'premium')
-  plan.value = 'premium'
-}
-
-export function quitarPremiumDemo() {
-  localStorage.removeItem('plan_demo')
-  plan.value = 'gratis'
-}
-
 export function destinoSeguro(valor) {
-  if (typeof valor === 'string' && valor.startsWith('/') && !valor.startsWith('//')) {
+  if (typeof valor === 'string' && valor.startsWith('/') && !valor.startsWith('//') && !/[\\\x00-\x20]/.test(valor)) {
     return valor
   }
   return '/'
@@ -75,3 +60,6 @@ function sincronizarSesion() {
 }
 
 window.addEventListener('sesion-expirada', sincronizarSesion)
+
+// Borra o sincroniza la sesión cuando otra pestaña cambia de cuenta.
+window.addEventListener('storage', e => { if (e.key === 'token' || e.key === 'usuario' || e.key === null) sincronizarSesion() })

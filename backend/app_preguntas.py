@@ -33,7 +33,7 @@ Cómo se arma la app (orden de las líneas de abajo):
        - /preguntas/...  (preguntas_bp)
        - /categorias/...  (categorias_bp)
     5. if __name__ == "__main__": al ejecutar este archivo se levanta
-       el servidor de desarrollo en el puerto 5001, debug=True.
+       el servidor de desarrollo en el puerto 5001, debug=False.
 """
 
 from flask import Flask
@@ -42,6 +42,8 @@ from config import Config
 from extensions import mysql
 from routes.categorias import categorias_bp
 from routes.preguntas import preguntas_bp
+from routes.comunidades import comunidades_bp
+from routes.multimedia import multimedia_bp
 
 # 1) App Flask de este proceso (servicio de preguntas).
 app = Flask(__name__)
@@ -52,9 +54,11 @@ mysql.init_app(app)
 
 # 4) CRUD de preguntas: prefijo /preguntas (routes/preguntas.py).
 app.register_blueprint(preguntas_bp)
+app.register_blueprint(comunidades_bp)
+app.register_blueprint(multimedia_bp)
 # 4) CRUD de categorías: prefijo /categorias (routes/categorias.py).
 app.register_blueprint(categorias_bp)
 
 # 5) Solo al ejecutar "python app_preguntas.py": servidor en puerto 5001.
 if __name__ == "__main__":
-    app.run(port=5001, debug=True)
+    app.run(port=5001, debug=False)

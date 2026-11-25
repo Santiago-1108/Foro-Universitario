@@ -33,7 +33,7 @@ Cómo se arma la app (orden de las líneas de abajo):
        - /comentarios/...  (comentarios_bp)
        - /votos/...  (votos_bp)
     5. if __name__ == "__main__": al ejecutar este archivo se levanta
-       el servidor de desarrollo en el puerto 5002, debug=True.
+       el servidor de desarrollo en el puerto 5002, debug=False.
 """
 
 from flask import Flask
@@ -60,4 +60,4 @@ app.register_blueprint(votos_bp)
 
 # 5) Solo al ejecutar "python app_interacciones.py": servidor en puerto 5002.
 if __name__ == "__main__":
-    app.run(port=5002, debug=True)
+    app.run(port=5002, debug=False)

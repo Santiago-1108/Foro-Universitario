@@ -1,45 +1,56 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import { apiFetch } from '../services/api.js'
-import { usuario } from '../services/sesion.js'
 import { formatearFecha } from '../utils/formato.js'
 
-const CLAVE_SUSPENSION = 'suspensiones_demo'
-
 const pestaña = ref('usuarios')
-const cargando = ref(false)
-const error = ref('')
-const aviso = ref('')
-const usuarios = ref([])
-const preguntas = ref([])
-const idPregunta = ref('')
-const detalle = ref([])
-const suspendidos = ref(leerSuspensiones())
-
-function leerSuspensiones() {
-  try {
-    const lista = JSON.parse(localStorage.getItem(CLAVE_SUSPENSION) || '[]')
-    return new Set(Array.isArray(lista) ? lista : [])
-  } catch {
-    return new Set()
-  }
+const cargando = ref(false), ocupado = ref(false)
+const error = ref(''), aviso = ref('')
+const usuarios = ref([]), preguntas = ref([]), idPregunta = ref(''), detalle = ref([])
+const estadisticas = ref({}), reportes = ref([]), historial = ref([])
+const estadoReporte = ref('pendiente'), siguienteReporte = ref(null), siguienteHistorial = ref(null)
+const titulos = {usuarios:'Usuarios',suspendidos:'Suspendidos',comunidades:'Comunidades',publicaciones:'Publicaciones',respuestas:'Respuestas',comentarios:'Comentarios',cerradas:'Conversaciones cerradas',reportes_pendientes:'Reportes pendientes'}
+async function cargarEstadisticas(){estadisticas.value=await apiFetch('usuarios','/moderacion/estadisticas')}
+async function cargarReportes(mas=false){
+  if(ocupado.value) return
+  ocupado.value=true; error.value=''
+  try{const r=await apiFetch('usuarios',`/moderacion/reportes?estado=${estadoReporte.value}${mas&&siguienteReporte.value?'&antes='+siguienteReporte.value:''}`); reportes.value=mas?[...reportes.value,...r.elementos]:r.elementos; siguienteReporte.value=r.siguiente}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
 }
-
-function guardarSuspensiones(conjunto) {
-  suspendidos.value = conjunto
-  localStorage.setItem(CLAVE_SUSPENSION, JSON.stringify([...conjunto]))
+async function cargarHistorial(mas=false){
+  if(ocupado.value) return
+  ocupado.value=true; error.value=''
+  try{const r=await apiFetch('usuarios',`/moderacion/historial${mas&&siguienteHistorial.value?'?antes='+siguienteHistorial.value:''}`); historial.value=mas?[...historial.value,...r.elementos]:r.elementos; siguienteHistorial.value=r.siguiente}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
 }
-
-function estaSuspendido(id) {
-  return suspendidos.value.has(id)
+async function abrirTab(tab){pestaña.value=tab; if(tab==='reportes') await cargarReportes(); if(tab==='historial') await cargarHistorial(); if(tab==='estadisticas'){try{await cargarEstadisticas()}catch(e){error.value=e.message}}}
+async function alternarSuspension(persona){
+  if(ocupado.value || persona.rol==='admin') return
+  const motivo=window.prompt(persona.suspendido?'Motivo de reactivación':'Motivo de suspensión'); if(!motivo?.trim()) return
+  ocupado.value=true; error.value=''; aviso.value=''
+  try{const r=await apiFetch('usuarios',`/moderacion/usuarios/${persona.id}/suspension`,{method:'PUT',body:JSON.stringify({activo:!persona.suspendido,motivo})}); persona.suspendido=r.suspendido; aviso.value='Estado de cuenta actualizado.'; await cargarEstadisticas()}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
 }
-
-function alternarSuspension(id) {
-  const copia = new Set(suspendidos.value)
-  if (copia.has(id)) copia.delete(id)
-  else copia.add(id)
-  guardarSuspensiones(copia)
-  aviso.value = 'La suspensión es una demostración de este navegador. El servidor no guarda bloqueos.'
+async function moderarPregunta(pregunta,campo){
+  if(ocupado.value)return
+  const motivo=window.prompt('Motivo de la acción (opcional)',''); if(motivo===null)return
+  ocupado.value=true; error.value=''; aviso.value=''
+  try{const r=await apiFetch('usuarios',`/moderacion/preguntas/${pregunta.id}`,{method:'PUT',body:JSON.stringify({[campo]:!pregunta[campo],motivo})}); Object.assign(pregunta,r); aviso.value='Publicación actualizada.'; await cargarEstadisticas()}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
+}
+async function revisarReporte(reporte,estado){
+  if(ocupado.value)return
+  const nota=window.prompt('Nota de revisión (opcional)',''); if(nota===null)return
+  ocupado.value=true; error.value=''; aviso.value=''
+  try{await apiFetch('usuarios',`/moderacion/reportes/${reporte.id}`,{method:'PUT',body:JSON.stringify({estado,nota})}); reporte.estado=estado; if(estadoReporte.value==='pendiente')reportes.value=reportes.value.filter(r=>r.id!==reporte.id); aviso.value='Reporte revisado.'; await cargarEstadisticas()}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
+}
+async function retirarReportado(reporte){
+  if(ocupado.value || !window.confirm('¿Retirar este contenido? Se conservará en la base de datos.'))return
+  const destinos={pregunta:['foro','preguntas'],respuesta:['interacciones','respuestas'],comentario:['interacciones','comentarios']}; const destino=destinos[reporte.tipo]; if(!destino)return
+  ocupado.value=true; error.value=''; aviso.value=''
+  try{await apiFetch(destino[0],`/${destino[1]}/${reporte.id_objeto}`,{method:'DELETE'}); aviso.value='Contenido retirado. Revisa el reporte cuando termines.'; await cargarPreguntas(); await cargarDetalle(); await cargarEstadisticas()}
+  catch(e){error.value=e.message}finally{ocupado.value=false}
 }
 
 async function cargarUsuarios() {
@@ -47,9 +58,9 @@ async function cargarUsuarios() {
 }
 
 async function cargarPreguntas() {
-  preguntas.value = await apiFetch('foro', '/preguntas')
-  if (!idPregunta.value && preguntas.value.length > 0) {
-    idPregunta.value = String(preguntas.value[0].id)
+  preguntas.value = await apiFetch('foro', '/preguntas?gestion=1')
+  if (!preguntas.value.some(p=>String(p.id)===idPregunta.value)) {
+    idPregunta.value = preguntas.value.length ? String(preguntas.value[0].id) : ''
   }
 }
 
@@ -59,10 +70,10 @@ async function cargarDetalle() {
     return
   }
   try {
-    const respuestas = await apiFetch('interacciones', `/respuestas/pregunta/${idPregunta.value}`)
+    const respuestas = await apiFetch('interacciones', `/respuestas/pregunta/${idPregunta.value}?gestion=1`)
     detalle.value = await Promise.all(
       respuestas.map(async (respuesta) => {
-        const comentarios = await apiFetch('interacciones', `/comentarios/respuesta/${respuesta.id}`).catch(() => [])
+        const comentarios = await apiFetch('interacciones', `/comentarios/respuesta/${respuesta.id}?gestion=1`)
         return { ...respuesta, comentarios }
       }),
     )
@@ -75,25 +86,12 @@ async function iniciar() {
   cargando.value = true
   error.value = ''
   try {
-    await Promise.all([cargarUsuarios(), cargarPreguntas()])
+    await Promise.all([cargarUsuarios(), cargarPreguntas(), cargarEstadisticas()])
     await cargarDetalle()
   } catch (e) {
     error.value = e.message
   } finally {
     cargando.value = false
-  }
-}
-
-async function eliminarUsuario(persona) {
-  if (persona.id === usuario.value?.id) return
-  if (!window.confirm(`¿Eliminar a ${persona.nombre_apellido}? Esta acción usa el servidor.`)) return
-  error.value = ''
-  try {
-    await apiFetch('usuarios', `/usuarios/${persona.id}`, { method: 'DELETE' })
-    usuarios.value = usuarios.value.filter((item) => item.id !== persona.id)
-    aviso.value = 'Usuario eliminado.'
-  } catch (e) {
-    error.value = e.message
   }
 }
 
@@ -130,7 +128,7 @@ async function eliminarComentario(respuesta, comentario) {
   error.value = ''
   try {
     await apiFetch('interacciones', `/comentarios/${comentario.id}`, { method: 'DELETE' })
-    respuesta.comentarios = respuesta.comentarios.filter((item) => item.id !== comentario.id)
+    await cargarDetalle()
     aviso.value = 'Comentario eliminado.'
   } catch (e) {
     error.value = e.message
@@ -141,16 +139,17 @@ onMounted(iniciar)
 </script>
 
 <template>
-  <main class="pagina">
+  <main class="pagina pagina-admin">
     <header class="pagina-encabezado">
       <h1>Administración</h1>
       <p>Modera usuarios, preguntas y comentarios. Esta sección solo aparece si tu rol es admin.</p>
     </header>
 
-    <div class="chips" role="tablist" aria-label="Módulos de administración">
-      <button type="button" class="chip" role="tab" :class="{ 'chip-activo': pestaña === 'usuarios' }" :aria-selected="pestaña === 'usuarios'" @click="pestaña = 'usuarios'">Usuarios</button>
-      <button type="button" class="chip" role="tab" :class="{ 'chip-activo': pestaña === 'preguntas' }" :aria-selected="pestaña === 'preguntas'" @click="pestaña = 'preguntas'">Preguntas</button>
-      <button type="button" class="chip" role="tab" :class="{ 'chip-activo': pestaña === 'comentarios' }" :aria-selected="pestaña === 'comentarios'" @click="pestaña = 'comentarios'">Comentarios</button>
+    <div class="chips" role="group" aria-label="Módulos de administración">
+      <button type="button" class="chip"  :class="{ 'chip-activo': pestaña === 'usuarios' }" :aria-pressed="pestaña === 'usuarios'" @click="pestaña = 'usuarios'">Usuarios</button>
+      <button type="button" class="chip"  :class="{ 'chip-activo': pestaña === 'preguntas' }" :aria-pressed="pestaña === 'preguntas'" @click="pestaña = 'preguntas'">Preguntas</button>
+      <button type="button" class="chip"  :class="{ 'chip-activo': pestaña === 'comentarios' }" :aria-pressed="pestaña === 'comentarios'" @click="pestaña = 'comentarios'">Comentarios</button>
+      <button v-for="tab in ['reportes','estadisticas','historial']" :key="tab" type="button" class="chip"  :class="{'chip-activo':pestaña===tab}" :aria-pressed="pestaña===tab" :disabled="ocupado" @click="abrirTab(tab)">{{tab==='reportes'?'Reportes':tab==='estadisticas'?'Estadísticas':'Historial'}}</button>
     </div>
 
     <p v-if="aviso" class="aviso-exito" role="status">{{ aviso }}</p>
@@ -158,7 +157,7 @@ onMounted(iniciar)
     <p v-if="cargando" class="foro-estado">Cargando…</p>
 
     <section v-else-if="pestaña === 'usuarios'" aria-label="Usuarios">
-      <p class="nota-demo">Suspender no bloquea la cuenta en el servidor: solo queda marcado en este navegador.</p>
+      <p>Las suspensiones se guardan en el servidor y revocan las sesiones de la cuenta.</p>
       <ul class="lista-admin">
         <li v-for="persona in usuarios" :key="persona.id">
           <div>
@@ -167,24 +166,17 @@ onMounted(iniciar)
               <span>{{ persona.correo }}</span>
               <span aria-hidden="true">·</span>
               <span>{{ persona.rol }}</span>
-              <template v-if="estaSuspendido(persona.id)">
+              <template v-if="persona.suspendido">
                 <span aria-hidden="true">·</span>
-                <span>Suspendido · demo</span>
+                <span>Suspendido</span>
               </template>
             </p>
           </div>
           <div class="acciones-admin">
-            <button type="button" class="btn-texto" @click="alternarSuspension(persona.id)">
-              {{ estaSuspendido(persona.id) ? 'Quitar suspensión' : 'Suspender' }}
+            <button type="button" class="btn-texto" :disabled="ocupado || persona.rol==='admin'" @click="alternarSuspension(persona)">
+              {{ persona.suspendido ? 'Quitar suspensión' : 'Suspender' }}
             </button>
-            <button
-              type="button"
-              class="btn-texto btn-peligro"
-              :disabled="persona.id === usuario?.id"
-              @click="eliminarUsuario(persona)"
-            >
-              Eliminar usuario
-            </button>
+
           </div>
         </li>
       </ul>
@@ -203,14 +195,34 @@ onMounted(iniciar)
               <time :datetime="pregunta.fecha_creacion">{{ formatearFecha(pregunta.fecha_creacion) }}</time>
             </p>
           </div>
+          <div class="acciones-admin">
+          <button type="button" class="btn-texto" :disabled="ocupado" @click="moderarPregunta(pregunta,'fijada')">{{pregunta.fijada?'Desfijar':'Fijar'}}</button>
+          <button type="button" class="btn-texto" :disabled="ocupado" @click="moderarPregunta(pregunta,'cerrada')">{{pregunta.cerrada?'Reabrir':'Cerrar conversación'}}</button>
           <button type="button" class="btn-texto btn-peligro" @click="eliminarPregunta(pregunta)">
             Eliminar pregunta
-          </button>
+          </button></div>
         </li>
       </ul>
       <p v-if="preguntas.length === 0" class="foro-vacio">No hay preguntas publicadas.</p>
     </section>
 
+    <section v-else-if="pestaña==='reportes'" aria-label="Reportes">
+      <label>Estado<select v-model="estadoReporte" :disabled="ocupado" @change="cargarReportes()"><option value="pendiente">Pendientes</option><option value="atendido">Atendidos</option><option value="descartado">Descartados</option><option value="todos">Todos</option></select></label>
+      <p v-if="!reportes.length" class="foro-vacio">No hay reportes para este filtro.</p>
+      <article v-for="r in reportes" :key="r.id" class="tarjeta-pregunta">
+        <h2>{{r.tipo}} #{{r.id_objeto}} · {{r.motivo}}</h2><p>{{r.contenido_reportado || 'Contenido no disponible'}}</p><p>{{r.detalle}}</p>
+        <p class="tarjeta-meta">Reportado por {{r.reportante}} · {{r.estado}} · {{formatearFecha(r.fecha_creacion)}}</p>
+        <p v-if="r.nota_revision">Nota: {{r.nota_revision}}</p>
+        <div class="tarjeta-acciones"><router-link v-if="r.id_pregunta" :to="`/preguntas/${r.id_pregunta}`">Abrir conversación</router-link><router-link v-if="r.tipo==='usuario'" :to="`/usuarios/${r.id_objeto}`">Abrir perfil</router-link>
+          <button v-if="r.estado==='pendiente' && r.tipo!=='usuario'" type="button" class="btn-texto btn-peligro" :disabled="ocupado" @click="retirarReportado(r)">Retirar contenido</button>
+          <button v-if="r.estado==='pendiente'" type="button" class="btn-texto" :disabled="ocupado" @click="revisarReporte(r,'atendido')">Marcar atendido</button>
+          <button v-if="r.estado==='pendiente'" type="button" class="btn-texto" :disabled="ocupado" @click="revisarReporte(r,'descartado')">Descartar</button>
+        </div>
+      </article>
+      <button v-if="siguienteReporte" class="btn-texto" type="button" :disabled="ocupado" @click="cargarReportes(true)">Cargar más</button>
+    </section>
+    <section v-else-if="pestaña==='estadisticas'" aria-label="Estadísticas"><ul class="lista-admin admin-metricas"><li v-for="(valor,clave) in estadisticas" :key="clave"><strong>{{titulos[clave] || clave}}</strong><span>{{valor}}</span></li></ul></section>
+    <section v-else-if="pestaña==='historial'" aria-label="Historial"><p v-if="!historial.length" class="foro-vacio">No hay acciones registradas.</p><ul class="lista-admin"><li v-for="h in historial" :key="h.id"><div><strong>{{h.accion}} · {{h.tipo}} #{{h.id_objeto}}</strong><p>{{h.detalle}}</p><p class="tarjeta-meta">{{h.administrador}} · {{formatearFecha(h.fecha_creacion)}}</p></div></li></ul><button v-if="siguienteHistorial" class="btn-texto" type="button" :disabled="ocupado" @click="cargarHistorial(true)">Cargar más</button></section>
     <section v-else aria-label="Comentarios">
       <label>
         Pregunta
@@ -242,7 +254,7 @@ onMounted(iniciar)
               <span aria-hidden="true">·</span>
               <time :datetime="comentario.fecha_creacion">{{ formatearFecha(comentario.fecha_creacion) }}</time>
             </p>
-            <button type="button" class="btn-texto btn-peligro" @click="eliminarComentario(respuesta, comentario)">
+            <button v-if="!comentario.eliminado" type="button" class="btn-texto btn-peligro" @click="eliminarComentario(respuesta, comentario)">
               Eliminar comentario
             </button>
           </li>

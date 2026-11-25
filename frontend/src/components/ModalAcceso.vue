@@ -5,6 +5,8 @@ import { cerrarModalAcceso, modalAcceso } from '../services/sesion.js'
 
 const route = useRoute()
 const titulo = ref(null)
+const dialogo = ref(null)
+let focoAnterior = null
 
 const consulta = computed(() => {
   const camino = route.fullPath
@@ -15,14 +17,31 @@ const consulta = computed(() => {
 watch(
   () => modalAcceso.value.abierto,
   async (abierto) => {
-    if (!abierto) return
-    await nextTick()
-    titulo.value?.focus()
+    if (abierto) {
+      focoAnterior = document.activeElement
+      await nextTick()
+      if (modalAcceso.value.abierto) titulo.value?.focus()
+    } else {
+      const anterior = focoAnterior
+      focoAnterior = null
+      await nextTick()
+      if (!modalAcceso.value.abierto && anterior?.isConnected) anterior.focus()
+    }
   },
 )
 
 function alTecla(evento) {
-  if (evento.key === 'Escape' && modalAcceso.value.abierto) cerrarModalAcceso()
+  if (!modalAcceso.value.abierto) return
+  if (evento.key === 'Escape') { evento.preventDefault(); cerrarModalAcceso(); return }
+  if (evento.key !== 'Tab' || !dialogo.value) return
+  const controles = [...dialogo.value.querySelectorAll('a[href], button:not([disabled])')]
+  if (!controles.length) { evento.preventDefault(); return }
+  const primero = controles[0], ultimo = controles[controles.length - 1]
+  const actual = document.activeElement
+  if (!controles.includes(actual) || (evento.shiftKey && actual === primero) || (!evento.shiftKey && actual === ultimo)) {
+    evento.preventDefault()
+    ;(evento.shiftKey ? ultimo : primero).focus()
+  }
 }
 
 onMounted(() => window.addEventListener('keydown', alTecla))
@@ -38,6 +57,7 @@ onUnmounted(() => window.removeEventListener('keydown', alTecla))
   >
     <div
       class="modal-tarjeta"
+      ref="dialogo"
       role="dialog"
       aria-modal="true"
       aria-labelledby="titulo-modal-acceso"
